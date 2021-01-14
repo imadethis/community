@@ -89,6 +89,15 @@ public class HybridInspectSql {
   private static final int MAX_REQUEST_BYTES = 480000; // max request size in bytes
   private static final int MAX_REQUEST_CELLS = 50000; // max cell count per request
 
+
+  public static class dStats {
+    public int tableCount = 0;
+    public long totalSize = 0;
+    public int totalRequests = 0;
+
+  }
+
+
   /**
    * Class object for a Database instance
    */
@@ -143,7 +152,6 @@ public class HybridInspectSql {
     }
 
   }
-
 
   /**
    * Command line application to inspect data using the Data Loss Prevention Hybrid
@@ -203,6 +211,8 @@ public class HybridInspectSql {
     int totalDatabaseCount = 0;
     int totalTableCount = 0;
 
+    dStats finalStats = new dStats();
+
     if (cmd.hasOption(sqlOption.getOpt())) {
       //Read information from command line parameters to scan a single source
       Database tempDB = new HybridInspectSql.Database(Integer.parseInt(cmd.getOptionValue(threadPoolSizeOption.getOpt(), "1")),
@@ -214,7 +224,7 @@ public class HybridInspectSql {
                                                       cmd.getOptionValue(tableNameOption.getOpt()),
                                                       cmd.getOptionValue(databaseUserOption.getOpt()),
                                                       cmd.getOptionValue(secretManagerResourceNameOption.getOpt()) );
-      totalTableCount = inspectSQLDb(tempDB, cmd.getOptionValue(hybridJobNameOption.getOpt(),null), runId);
+      finalStats =  inspectSQLDb(tempDB, cmd.getOptionValue(hybridJobNameOption.getOpt(),null), runId);
       totalDatabaseCount++;
     }
     else if (cmd.hasOption(databasesOption.getOpt())) {
@@ -225,12 +235,12 @@ public class HybridInspectSql {
 
       // set up threading for the first level of threads (e.g. how many data sources do we scan in parallel)
       final ExecutorService executorDB = Executors.newFixedThreadPool(new Integer(cmd.getOptionValue(threadPoolSizeOption.getOpt())).intValue());
-      final Map<String, Future<Integer>> futuresDB = new HashMap<>();
+      final Map<String, Future<dStats>> futuresDB = new HashMap<>();
 
       //Loop through all databases and inspect
       for (Database tempDB : databases) {
         LOG.info(String.format("Scanning data sources: ",tempDB.toString()));
-        Future<Integer> futureDB =
+        Future<dStats> futureDB =
             executorDB.submit(
                 () -> inspectSQLDb(tempDB, cmd.getOptionValue(hybridJobNameOption.getOpt(),null), runId));
         futuresDB.put(tempDB.databaseName, futureDB);
@@ -241,7 +251,10 @@ public class HybridInspectSql {
         try {
           // 10 minute timeout. Note that this a timeout on creating & sending the hybrid request(s),
           // not waiting for it to finish.  Larger data sources may need more time.
-          totalTableCount += futuresDB.get(databaseName).get(10, TimeUnit.MINUTES).intValue();
+          dStats tempStats = futuresDB.get(databaseName).get(10, TimeUnit.MINUTES);
+          finalStats.tableCount += tempStats.tableCount;
+          finalStats.totalSize += tempStats.totalSize;
+          finalStats.totalRequests += tempStats.totalRequests;
           totalDatabaseCount++;
         } catch (TimeoutException e) {
           LOG.log(Level.WARNING, String.format("Timed out creating a scan for table %s", databaseName), e);
@@ -263,7 +276,10 @@ public class HybridInspectSql {
     System.out.println("-----------------------------------------------------------------");
     System.out.println(" End Run ID: " + runId);
     System.out.println(" Total Databases scanned: " + totalDatabaseCount);
-    System.out.println(" Total Tables scanned: " + totalTableCount);
+    System.out.println(" Total Tables scanned: " + finalStats.tableCount);
+    System.out.println(" Total Bytes: " + humanReadableByteCountSI(finalStats.totalSize));
+    System.out.println(" Total Requests: " + finalStats.totalRequests);
+    System.out.println(" Average Request Size: " + humanReadableByteCountSI(finalStats.totalSize/finalStats.totalRequests));
     System.out.println(" End Time: " + endTime.toString());
     System.out.print  (" Duration: ");
     System.out.print  ("  " + diffDays + " days, ");
@@ -296,7 +312,7 @@ public class HybridInspectSql {
    * This method uses JDBC to read data from a SQL database, then chunks it and sends it to a Cloud
    * DLP Hybrid Job
    */
-  private static Integer inspectSQLDb(
+  private static dStats inspectSQLDb(
       Database database,
       String hybridJobName,
       String runId) throws Exception {
@@ -316,6 +332,8 @@ public class HybridInspectSql {
                             databasePassword);
     int countTablesScanned = 0;
 
+    dStats finalStats = new dStats();
+
     try  {
       DriverManager.registerDriver(getJdbcDriver(database.getDatabaseType()));
       Connection conn = DriverManager.getConnection(url, database.getDatabaseUser(), databasePassword);
@@ -329,7 +347,7 @@ public class HybridInspectSql {
 
       // this will iterate through every table, and initiate a hybrid inspect scan for it on a new thread
       final ExecutorService executor = Executors.newFixedThreadPool(database.getThreadPoolSize());
-      final Map<String, Future<?>> futures = new HashMap<>();
+      final Map<String, Future<dStats>> futures = new HashMap<>();
       while (ListTablesResults.next()) {
         // If we are filtering on table name, skip tables that don't match the filter
 
@@ -362,7 +380,7 @@ public class HybridInspectSql {
                 .putLabels("run-id", runId)
                 .build();
 
-        Future<?> future =
+        Future<dStats> future =
             executor.submit(
                 () -> scanTable(database.getSampleRowLimit(), hybridJobName, table, url, database.getDatabaseUser(),
                     databasePassword, hybridFindingDetails, database.getDatabaseType(), database.getDatabaseName()));
@@ -374,7 +392,10 @@ public class HybridInspectSql {
         try {
           // 5 minute timeout. Note that this a timeout on creating & sending the job request,
           // not waiting for it to finish.
-          futures.get(table).get(5, TimeUnit.MINUTES);
+          dStats tempStats = futures.get(table).get(5, TimeUnit.MINUTES);
+          finalStats.totalSize += tempStats.totalSize;
+          finalStats.totalRequests += tempStats.totalRequests;
+          finalStats.tableCount++;
           countTablesScanned++;
           System.out.println();
           System.out.print(String.format(">>>> Scanned table %s", table));
@@ -390,22 +411,38 @@ public class HybridInspectSql {
 
     System.out.println();
     System.out.print(String.format(">> [%s,%s:%s]: %s tables scanned successfully", database.databaseInstanceDescription, database.databaseInstanceServer, database.databaseName, countTablesScanned));
-    return new Integer(countTablesScanned);
+    return finalStats;
 
   }
+
+public static String humanReadableByteCountSI(long bytes) {
+    if (-1000 < bytes && bytes < 1000) {
+        return bytes + " B";
+    }
+    java.text.CharacterIterator ci = new java.text.StringCharacterIterator("kMGTPE");
+    while (bytes <= -999_950 || bytes >= 999_950) {
+        bytes /= 1000;
+        ci.next();
+    }
+    return String.format("%.1f %cB", bytes / 1000.0, ci.current());
+}
 
 
   /**
    * Scans a specific db table and creates a hybrid inspect job for it
    */
-  private static void scanTable(int sampleRowLimit, String hybridJobName, String table, String url,
+  private static dStats scanTable(int sampleRowLimit, String hybridJobName, String table, String url,
       String databaseUser, String databasePassword, HybridFindingDetails hybridFindingDetails, String databaseType, String databaseName) {
+
+    dStats finalStats = new dStats();
 
     try (Connection conn = DriverManager.getConnection(url, databaseUser, databasePassword);
         DlpServiceClient dlpClient = DlpServiceClient.create()) {
       LOG.log(Level.INFO, String.format(">>>>>> Table %s: reading data", table));
 
       // Doing a simple select * with a limit with no strict order
+
+
 
       String sqlQuery = getSqlQuery(databaseType, databaseName, table, sampleRowLimit);
 
@@ -446,6 +483,8 @@ public class HybridInspectSql {
         rows.add(convertCsvRowToTableRow(rowS));
       }
 
+      finalStats.totalSize = getBytesFromList(rows);
+
       LOG.log(Level.INFO, String.format(">>>>>> Table %s: inspecting data", table));
 
       int sentCount = 0;
@@ -477,10 +516,13 @@ public class HybridInspectSql {
             throw e;
           }
         }
+        
       }
+      finalStats.totalRequests = splitTotal;
     } catch (Exception e) {
       throw new RuntimeException(e);
     }
+    return finalStats;
   }
 
   /**
@@ -630,6 +672,7 @@ public class HybridInspectSql {
         throw new Exception("Single Row greater than max size - not currently supported");
       }
     }
+    System.out.println(">>>>>>>>  Request Size: " + getBytesFromList(subRows));
     return subRows;
   }
 
